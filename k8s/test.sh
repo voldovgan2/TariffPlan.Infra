@@ -1,21 +1,10 @@
 #!/bin/bash
+set -euo pipefail
 
-##############################################
-# CONFIGURATION
-##############################################
-
-STEP_DELAY=${STEP_DELAY:-10}
-
+DELAY=10
 TARIFF_BASE="http://nowlege.com/tariff-api/api/Tariff"
 SIMCARD_API_BASE="http://nowlege.com/simcard-api/api/SimCard"
 SIMCARD_VIEW_BASE="http://nowlege.com/simcard-view/api/SimCard"
-
-echo "Using STEP_DELAY = $STEP_DELAY seconds"
-echo ""
-
-##############################################
-# JSON BODIES
-##############################################
 
 CREATE_TARIFF_DRAFT_BODY='{
   "name": "Simple",
@@ -82,145 +71,182 @@ CREATE_SIMCARD_TEMPLATE='{
   "discountForPersonalization": 10
 }'
 
-##############################################
-# STEP 1: Create Tariff Draft
-##############################################
-echo "STEP 1: Creating Tariff Draft..."
-TARIFF_DRAFT_ID=$(curl -s -X POST "$TARIFF_BASE/create-tariff-draft" \
-    -H "Content-Type: application/json" \
-    -d "$CREATE_TARIFF_DRAFT_BODY" | jq -r .)
+start_env() {
+	cd Helm
+	helm install infra ./infra -n tariff-plan-app --create-namespace
+	helm install application ./application -n tariff-plan-app --create-namespace
+	kubectl apply -f ingress.yaml
+	local hosts_entry=$(getHostEntry)
+	if [[ -n "$hosts_entry" ]]; then
+		if ! grep -qF "$hosts_entry" /etc/hosts; then
+			sudo sh -c "echo '$hosts_entry' >> /etc/hosts"
+		fi
+   	fi
+   	cd ../
+}
 
-if [[ "$TARIFF_DRAFT_ID" == "null" || -z "$TARIFF_DRAFT_ID" ]]; then
-  echo "❌ ERROR: Failed to create tariff draft."
-  exit 1
+stop_env() {
+   	if kubectl get namespace tariff-plan-app >/dev/null 2>&1; then
+   	    local hosts_entry=$(getHostEntry)
+	    if [[ -n "$hosts_entry" ]]; then
+		    if grep -qF "$hosts_entry" /etc/hosts; then
+        	    sudo sed -i '' "\|$hosts_entry|d" /etc/hosts
+    	    fi
+   	    fi
+        kubectl delete namespace tariff-plan-app
+    fi
+}
+
+getHostEntry () {
+	local ingress_ip=$(getIngress)
+	echo "$ingress_ip	nowlege.com"
+}
+
+getIngress() {
+	local ingress_ip
+	local i=0
+	while (( i < 10 )); do
+    	local ingress_json=$(kubectl get ingress tariff-plan-ingress -n tariff-plan-app -o json)
+    	if echo "$ingress_json" | jq -e '.status.loadBalancer.ingress | length > 0' >/dev/null; then
+    		ingress_ip=$(echo "$ingress_json" | jq -r '.status.loadBalancer.ingress[0].ip')
+        	break
+    	fi
+    	sleep 10
+    	((i++))
+	done
+	echo "$ingress_ip"
+}
+
+post() {
+    local url=$1
+    local request_body=$2
+    local info=$3
+    local response=$(curl -X POST \
+        -sS \
+        -w "\n%{http_code}" \
+        -H "Content-Type: application/json" \
+        -d "$request_body" \
+        "$url")
+    local status=$(tail -n1 <<< "$response")
+    local response_body=$(sed '$d' <<< "$response")
+    if [[ $status = "200" ]]; then
+        local value=$(jq -r '.' <<< "$response_body")
+        echo "$value"
+        return 0
+    else
+        echo "$info failed: - $status"
+        return 1
+    fi
+}
+
+put() {
+    local url=$1
+    local request_body=$2
+    local info=$3
+    local response=$(curl -X PUT \
+        -sS \
+        -w "\n%{http_code}" \
+        -H "Content-Type: application/json" \
+        -d "$request_body" \
+        "$url")
+    local status=$(tail -n1 <<< "$response")
+    if [[ $status = "200" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+get() {
+    local url=$1
+    local info=$2
+    local response=$(curl -X GET \
+        -sS \
+        -w "\n%{http_code}" \
+        "$url")
+    local status=$(tail -n1 <<< "$response")
+    local response_body=$(sed '$d' <<< "$response")
+    if [[ $status = "200" ]]; then
+        local value=$(jq -r '.' <<< "$response_body")
+        echo "$value"
+        return 0
+    else
+        echo "$info failed: - $status"
+        return 1
+    fi
+}
+
+echo "This script needs sudo access to modify /etc/hosts"
+sudo -v
+
+echo "Stopping env (just in case)"
+stop_env
+
+echo "Starting env..."
+start_env
+
+echo "Running tests..."
+
+info="Step 1"
+echo "$info - Create tariff draft"
+tariff_draft_id=$(post "$TARIFF_BASE/create-tariff-draft" "$CREATE_TARIFF_DRAFT_BODY" "$info")
+echo "$info - OK"
+
+info="Step 2"
+echo "$info - Create tariff"
+create_tariff_body=$(jq -n --arg id "$tariff_draft_id" '$id')
+tariff_id=$(post "$TARIFF_BASE/create-tariff" "$create_tariff_body" "$info")
+echo "$info - OK"
+
+info="Step 3"
+echo "$info - Get tariff"
+tariff=$(get "$TARIFF_BASE/get-tariff/$tariff_id" "$info")
+echo "$info - OK"
+
+info="Step 4"
+echo "$info - Create simcard"
+tariff_name=$(jq -r '.name' <<< "$tariff")
+create_simcard_body=$(jq --arg id "$tariff_id" --arg name "$tariff_name" '.tariff.id = $id | .tariff.name = $name' <<< "$CREATE_SIMCARD_TEMPLATE")
+simcard_id=$(post "$SIMCARD_API_BASE/create" "$create_simcard_body" "$info")
+echo "$info - OK"
+
+info="Step 5"
+echo "$info - Get simcard"
+sleep "$DELAY"
+simcard=$(get "$SIMCARD_VIEW_BASE/get-simcard/$simcard_id" "$info")
+echo "$info - OK"
+
+info="Step 6"
+echo "$info - Update tariff"
+new_tariff_name="Free"
+update_tariff_body=$(jq --arg name "$new_tariff_name" '.name = $name' <<< "$tariff")
+put "$TARIFF_BASE/update-tariff" "$update_tariff_body" "$info"
+echo "$info - OK"
+
+info="Step 7"
+echo "$info - Get tariff"
+tariff=$(get "$TARIFF_BASE/get-tariff/$tariff_id" "$info")
+tariff_name=$(jq -r '.name' <<< "$tariff")
+if [[ $tariff_name = $new_tariff_name ]]; then
+    echo "$info - OK"
+else
+    echo "$info failed: $tariff_name != $new_tariff_name"
+    exit 1
 fi
 
-echo "✔ Created TariffDraftId: $TARIFF_DRAFT_ID"
-echo ""
-sleep "$STEP_DELAY"
-
-##############################################
-# STEP 2: Create Tariff
-##############################################
-echo "STEP 2: Creating Tariff..."
-TARIFF_ID=$(echo "\"$TARIFF_DRAFT_ID\"" | curl -s -X POST "$TARIFF_BASE/create-tariff" \
-      -H "Content-Type: application/json" \
-      -d @- | jq -r .)
-
-if [[ "$TARIFF_ID" == "null" || -z "$TARIFF_ID" ]]; then
-  echo "❌ ERROR: Failed to create tariff."
-  exit 1
+info="Step 8"
+echo "$info - Get simcard"
+sleep "$DELAY"
+simcard=$(get "$SIMCARD_VIEW_BASE/get-simcard/$simcard_id" "$info")
+simcard_tariff_name=$(jq -r '.tariff.name' <<< "$simcard")
+if [[ $simcard_tariff_name = $new_tariff_name ]]; then
+    echo "$info - OK"
+else
+    echo "$info failed: $simcard_tariff_name != $new_tariff_name"
+    exit 1
 fi
 
-echo "✔ Created TariffId: $TARIFF_ID"
-echo ""
-sleep "$STEP_DELAY"
+echo "Stopping env..."
+stop_env
+echo "Done"
 
-##############################################
-# STEP 3: Get Tariff
-##############################################
-echo "STEP 3: Fetching Tariff..."
-GET_TARIFF_RESULT=$(curl -s "$TARIFF_BASE/get-tariff/$TARIFF_ID")
-
-if [[ -z "$GET_TARIFF_RESULT" || "$GET_TARIFF_RESULT" == "null" ]]; then
-  echo "❌ ERROR: Failed to fetch tariff."
-  exit 1
-fi
-
-TARIFF_NAME=$(echo "$GET_TARIFF_RESULT" | jq -r '.name')
-
-echo "✔ Tariff fetched successfully:"
-echo "$GET_TARIFF_RESULT" | jq .
-echo ""
-sleep "$STEP_DELAY"
-
-##############################################
-# STEP 4: Create SimCard (original tariff)
-##############################################
-echo "STEP 4: Creating SimCard with original tariff..."
-CREATE_SIMCARD_BODY=$(jq --arg tariffId "$TARIFF_ID" --arg tariffName "$TARIFF_NAME" \
-    '.tariff.id = $tariffId | .tariff.name = $tariffName' <<< "$CREATE_SIMCARD_TEMPLATE")
-
-echo "📦 CREATE_SIMCARD_BODY:"
-echo "$CREATE_SIMCARD_BODY" | jq .
-echo ""
-
-SIMCARD_ID_1=$(echo "$CREATE_SIMCARD_BODY" | \
-    curl -s -X POST "$SIMCARD_API_BASE/create" \
-    -H "Content-Type: application/json" \
-    -d @- | jq -r .)
-
-if [[ "$SIMCARD_ID_1" == "null" || -z "$SIMCARD_ID_1" ]]; then
-  echo "❌ ERROR: SimCard creation failed."
-  exit 1
-fi
-
-echo "✔ Created SimCardId: $SIMCARD_ID_1"
-echo ""
-sleep "$STEP_DELAY"
-
-##############################################
-# STEP 5: Get SimCard
-##############################################
-echo "STEP 5: Fetching SimCard..."
-GET_SIMCARD_1=$(curl -s "$SIMCARD_VIEW_BASE/get-simcard/$SIMCARD_ID_1")
-
-if [[ -z "$GET_SIMCARD_1" ]]; then
-  echo "❌ ERROR: Failed to fetch SimCard."
-  exit 1
-fi
-
-echo "✔ SimCard fetched successfully:"
-echo "$GET_SIMCARD_1" | jq .
-echo ""
-sleep "$STEP_DELAY"
-
-##############################################
-# STEP 6: Update Tariff (rename 'name' to 'Free')
-##############################################
-echo "STEP 6: Updating Tariff..."
-UPDATE_TARIFF_BODY=$(echo "$GET_TARIFF_RESULT" | jq '.name = "Free"')
-
-# Call PUT /update-tariff silently
-echo "$UPDATE_TARIFF_BODY" | curl -s -X PUT "$TARIFF_BASE/update-tariff" \
-    -H "Content-Type: application/json" \
-    -d @-
-
-echo "✔ Tariff updated."
-echo ""
-sleep "$STEP_DELAY"
-
-##############################################
-# STEP 7: Fetch Updated Tariff
-##############################################
-echo "STEP 7: Fetching Updated Tariff..."
-UPDATED_TARIFF=$(curl -s "$TARIFF_BASE/get-tariff/$TARIFF_ID")
-
-if [[ -z "$UPDATED_TARIFF" || "$UPDATED_TARIFF" == "null" ]]; then
-  echo "❌ ERROR: Failed to fetch updated tariff."
-  exit 1
-fi
-
-UPDATED_TARIFF_NAME=$(echo "$UPDATED_TARIFF" | jq -r '.name')
-
-echo "✔ Updated Tariff fetched successfully:"
-echo "$UPDATED_TARIFF" | jq .
-echo ""
-sleep "$STEP_DELAY"
-
-##############################################
-# STEP 8: Get first SimCard again
-##############################################
-echo "STEP 8: Fetching SimCard after tariff update..."
-GET_SIMCARD_2=$(curl -s "$SIMCARD_VIEW_BASE/get-simcard/$SIMCARD_ID_1")
-
-if [[ -z "$GET_SIMCARD_2" ]]; then
-  echo "❌ ERROR: Failed to fetch SimCard again."
-  exit 1
-fi
-
-echo "✔ SimCard fetched successfully after tariff update:"
-echo "$GET_SIMCARD_2" | jq .
-echo ""
-
-echo "🎉 TEST COMPLETED SUCCESSFULLY!"
